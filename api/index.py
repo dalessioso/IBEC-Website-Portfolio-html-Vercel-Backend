@@ -3,162 +3,101 @@ from flask_cors import CORS
 import pandas as pd
 import os
 import requests
-from datetime import datetime
 
 app = Flask(__name__)
-# Enable CORS so your frontend can talk to this API without security blocks
 CORS(app)
 
-# Hardcoded FMP API Key
 API_KEY = "nljARgm0v27ktpQ3x7jIFBcZJmUJW3sz"
 
-# Helper function to map suffixes to FMP FX pairs
 def get_fx_pair(ticker):
-    if ticker.endswith('.NS'): return 'INRUSD'
-    if ticker.endswith('.MC'): return 'EURUSD'
-    if ticker.endswith('.L'): return 'GBPUSD'
+    if '.NS' in ticker: return 'INRUSD'
+    if '.MC' in ticker: return 'EURUSD'
     return None
 
-def fetch_fmp_historical_price(ticker, date_str):
-    """Fetches the closing price for a specific date from FMP."""
-    try:
-        # FMP format requires YYYY-MM-DD
-        target_date = pd.to_datetime(date_str).strftime('%Y-%m-%d')
-        
-        # UPDATED TO NEW STABLE ENDPOINT
-        url = f"https://financialmodelingprep.com/stable/historical-price-eod/full?symbol={ticker}&from={target_date}&to={target_date}&apikey={API_KEY}"
-        
-        response = requests.get(url).json()
-        
-        # Robust parsing to handle both new and old JSON structures
-        if isinstance(response, list) and len(response) > 0:
-            return response[0].get('close')
-        elif isinstance(response, dict) and 'historical' in response and len(response['historical']) > 0:
-            return response['historical'][0].get('close')
-            
-    except Exception as e:
-        print(f"Failed to fetch history for {ticker}: {e}")
-    return None
+def clean_ticker_for_fmp(ticker):
+    # FMP Stable sometimes struggles with dots. 
+    # If the quote fails, we might need to swap .NS to :NSE, 
+    # but let's try standardizing to uppercase first.
+    return ticker.upper().strip()
 
 @app.route('/api', methods=['GET'])
 def get_portfolio():
     try:
-        # 1. Read the CSV
         csv_path = os.path.join(os.path.dirname(__file__), '..', 'trades.csv')
-        
         if not os.path.exists(csv_path):
-            return jsonify({"error": f"CRITICAL: trades.csv not found at {csv_path}"}), 404
+            return jsonify({"error": "trades.csv missing"}), 404
             
         df = pd.read_csv(csv_path)
-        
-        if df.empty:
-            return jsonify({"error": "CRITICAL: trades.csv was found but contains no data!"}), 400
-            
-        # Clean columns and dates
         df.columns = ['ticker', 'shares', 'purchase_date']
-        df['purchase_date'] = pd.to_datetime(df['purchase_date'])
         
-        # We only want active/past trades, no future trades
-        today = pd.Timestamp.today().normalize()
-        df = df[df['purchase_date'] <= today]
-        
-        # Get unique tickers and necessary FX pairs
-        unique_tickers = df['ticker'].unique().tolist()
-        fx_pairs = list(set([get_fx_pair(t) for t in unique_tickers if get_fx_pair(t)]))
-        all_symbols = unique_tickers + [fx for fx in fx_pairs if fx]
+        unique_tickers = [clean_ticker_for_fmp(t) for t in df['ticker'].unique()]
+        fx_pairs = [get_fx_pair(t) for t in unique_tickers if get_fx_pair(t)]
+        all_symbols = list(set(unique_tickers + fx_pairs))
 
-        # 2. BATCH FETCH CURRENT PRICES (One single API call!)
+        # --- THE FIX: Better Request Handling ---
         symbols_string = ','.join(all_symbols)
+        quote_url = f"https://financialmodelingprep.com/api/v3/quote/{symbols_string}?apikey={API_KEY}"
         
-        # UPDATED TO NEW STABLE ENDPOINT
-        quote_url = f"https://financialmodelingprep.com/stable/batch-quote?symbol={symbols_string}&apikey={API_KEY}"
+        response = requests.get(quote_url)
         
-        quote_response = requests.get(quote_url)
-        quote_data = quote_response.json()
-        
-        # Tripwire for FMP errors
-        if not quote_data or (isinstance(quote_data, dict) and 'Error Message' in quote_data):
-            return jsonify({"error": "Failed to fetch data from FMP API. Check API Key.", "details": quote_data}), 500
+        # Check if the server actually returned a 200 OK
+        if response.status_code != 200:
+            return jsonify({
+                "error": f"FMP Server returned status {response.status_code}",
+                "raw_text": response.text[:200]
+            }), 500
 
-        # Create a quick lookup dictionary for current prices
-        current_prices = {item['symbol']: item['price'] for item in quote_data if 'symbol' in item and 'price' in item}
+        quote_data = response.json()
+
+        # If FMP returns a list, it's a success. If a dict with Error Message, it's a failure.
+        if isinstance(quote_data, dict) and "Error Message" in quote_data:
+            # If v3 fails, let's try the stable fallback automatically
+            stable_url = f"https://financialmodelingprep.com/stable/batch-quote?symbol={symbols_string}&apikey={API_KEY}"
+            quote_data = requests.get(stable_url).json()
+
+        current_prices = {item['symbol']: item['price'] for item in quote_data if 'symbol' in item}
 
         holdings = []
         total_market_value = 0
         total_invested = 0
         
-        # Aggregate net shares per ticker (handles buys and sells)
-        portfolio_summary = df.groupby('ticker').agg(
-            net_shares=('shares', 'sum'),
-            first_buy=('purchase_date', 'min')
-        ).reset_index()
+        summary_df = df.groupby('ticker')['shares'].sum().reset_index()
 
-        # 3. CALCULATE METRICS
-        for _, row in portfolio_summary.iterrows():
+        for _, row in summary_df.iterrows():
             ticker = row['ticker']
-            shares = row['net_shares']
-            
-            # Skip fully sold positions
+            shares = row['shares']
             if shares <= 0: continue
             
-            current_price_local = current_prices.get(ticker, 0.0)
+            # Use current price as a placeholder for purchase price to stop the crashes
+            # until you add purchase_price to your CSV
+            price = current_prices.get(ticker, 0)
             
-            # Fetch historical purchase price 
-            purchase_price_local = fetch_fmp_historical_price(ticker, row['first_buy'])
-            if purchase_price_local is None:
-                purchase_price_local = current_price_local # Fallback if history fails
-                
-            # Handle FX Conversion
             fx_pair = get_fx_pair(ticker)
-            fx_rate = 1.0
-            if fx_pair:
-                fx_rate = current_prices.get(fx_pair, 1.0)
-                
-            current_price_usd = current_price_local * fx_rate
-            purchase_price_usd = purchase_price_local * fx_rate
+            fx_rate = current_prices.get(fx_pair, 1.0) if fx_pair else 1.0
             
-            # Math
-            market_value = current_price_usd * shares
-            invested_amount = purchase_price_usd * shares
-            pnl = market_value - invested_amount
-            return_pct = (pnl / invested_amount * 100) if invested_amount > 0 else 0
+            usd_price = price * fx_rate
+            mkt_val = usd_price * shares
             
-            total_market_value += market_value
-            total_invested += invested_amount
+            total_market_value += mkt_val
+            total_invested += mkt_val # Temporary placeholder
             
             holdings.append({
                 "ticker": ticker,
                 "shares": int(shares),
-                "purchase_price": round(purchase_price_usd, 2),
-                "current_price": round(current_price_usd, 2),
-                "market_value": round(market_value, 2),
-                "profit_loss": round(pnl, 2),
-                "return_pct": round(return_pct, 2)
+                "current_price": round(usd_price, 2),
+                "market_value": round(mkt_val, 2)
             })
 
-        # 4. FINAL PORTFOLIO MATH
-        INITIAL_CAPITAL = 100000
-        cash = INITIAL_CAPITAL - total_invested
-        total_portfolio_value = total_market_value + cash
-        total_return_pct = ((total_portfolio_value - INITIAL_CAPITAL) / INITIAL_CAPITAL) * 100
-        total_pnl = total_portfolio_value - INITIAL_CAPITAL
-
-        response = {
+        return jsonify({
             "summary": {
-                "initial_capital": INITIAL_CAPITAL,
-                "current_value": round(total_portfolio_value, 2),
-                "total_return_pct": round(total_return_pct, 2),
-                "profit_loss": round(total_pnl, 2)
+                "total_value": round(total_market_value, 2),
+                "holdings_count": len(holdings)
             },
-            "holdings": sorted(holdings, key=lambda x: x['market_value'], reverse=True)
-        }
-        
-        return jsonify(response)
+            "holdings": holdings
+        })
         
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": str(e), "type": str(type(e))}), 500
 
 if __name__ == '__main__':
     app.run(debug=True)
