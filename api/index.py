@@ -24,11 +24,18 @@ def fetch_fmp_historical_price(ticker, date_str):
     try:
         # FMP format requires YYYY-MM-DD
         target_date = pd.to_datetime(date_str).strftime('%Y-%m-%d')
-        url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{ticker}?from={target_date}&to={target_date}&apikey={API_KEY}"
+        
+        # UPDATED TO NEW STABLE ENDPOINT
+        url = f"https://financialmodelingprep.com/stable/historical-price-eod/full?symbol={ticker}&from={target_date}&to={target_date}&apikey={API_KEY}"
         
         response = requests.get(url).json()
-        if 'historical' in response and len(response['historical']) > 0:
-            return response['historical'][0]['close']
+        
+        # Robust parsing to handle both new and old JSON structures
+        if isinstance(response, list) and len(response) > 0:
+            return response[0].get('close')
+        elif isinstance(response, dict) and 'historical' in response and len(response['historical']) > 0:
+            return response['historical'][0].get('close')
+            
     except Exception as e:
         print(f"Failed to fetch history for {ticker}: {e}")
     return None
@@ -62,7 +69,9 @@ def get_portfolio():
 
         # 2. BATCH FETCH CURRENT PRICES (One single API call!)
         symbols_string = ','.join(all_symbols)
-        quote_url = f"https://financialmodelingprep.com/api/v3/quote/{symbols_string}?apikey={API_KEY}"
+        
+        # UPDATED TO NEW STABLE ENDPOINT
+        quote_url = f"https://financialmodelingprep.com/stable/batch-quote?symbol={symbols_string}&apikey={API_KEY}"
         
         quote_response = requests.get(quote_url)
         quote_data = quote_response.json()
@@ -151,6 +160,5 @@ def get_portfolio():
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
-# Vercel needs this to boot the WSGI application
 if __name__ == '__main__':
     app.run(debug=True)
