@@ -3,41 +3,40 @@ from flask_cors import CORS
 import yfinance as yf
 import pandas as pd
 import os
+import requests # <-- 1. Import requests
 
 app = Flask(__name__)
-# Enable CORS so your frontend can talk to this API without security blocks
 CORS(app)
 
-# Helper function to map suffixes to Yahoo Finance FX pairs
-def get_fx_pair(ticker):
-    if ticker.endswith('.NS'): return 'INRUSD=X'
-    if ticker.endswith('.MC'): return 'EURUSD=X'
-    if ticker.endswith('.L'): return 'GBPUSD=X'
-    return None
+# ... (get_fx_pair function stays the same) ...
 
 @app.route('/api', methods=['GET'])
 def get_portfolio():
     try:
-        # 1. Read the CSV (Going up one directory from /api, then into /build)
-        csv_path = os.path.join(os.path.dirname(__file__), '..', 'trades.csv')
-        df = pd.read_csv(csv_path)
+        # ... (CSV reading logic stays the same) ...
         
-        # Clean columns and dates
-        df.columns = ['ticker', 'shares', 'purchase_date']
-        df['purchase_date'] = pd.to_datetime(df['purchase_date'])
-        
-        # We only want active/past trades, no future trades
-        today = pd.Timestamp.today().normalize()
-        df = df[df['purchase_date'] <= today]
-        
-        # Get unique tickers and necessary FX pairs
         unique_tickers = df['ticker'].unique().tolist()
         fx_pairs = list(set([get_fx_pair(t) for t in unique_tickers if get_fx_pair(t)]))
         all_symbols = unique_tickers + fx_pairs
 
-        # 2. Bulk Download Data (Current and last 2 years for history)
-        # Using threads=True makes this incredibly fast
-        data = yf.download(all_symbols, period="2y", group_by='ticker', threads=True)
+        # 2. Bulk Download Data (UPDATED)
+        
+        # Create a custom session with a browser User-Agent
+        session = requests.Session()
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+        })
+
+        # Turn threading OFF and pass the custom session
+        data = yf.download(
+            all_symbols, 
+            period="2y", 
+            group_by='ticker', 
+            threads=False,    # <-- Critical for Vercel environments
+            session=session   # <-- Critical to bypass Yahoo's IP block
+        )
+        
+        # ... (Rest of your calculation logic stays exactly the same) ...
         
         holdings = []
         total_market_value = 0
