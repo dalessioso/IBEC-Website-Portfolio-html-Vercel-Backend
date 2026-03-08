@@ -3,25 +3,41 @@ from flask_cors import CORS
 import yfinance as yf
 import pandas as pd
 import os
-import requests # <-- 1. Import requests
+import requests
 
 app = Flask(__name__)
+# Enable CORS so your frontend can talk to this API without security blocks
 CORS(app)
 
-# ... (get_fx_pair function stays the same) ...
+# Helper function to map suffixes to Yahoo Finance FX pairs
+def get_fx_pair(ticker):
+    if ticker.endswith('.NS'): return 'INRUSD=X'
+    if ticker.endswith('.MC'): return 'EURUSD=X'
+    if ticker.endswith('.L'): return 'GBPUSD=X'
+    return None
 
 @app.route('/api', methods=['GET'])
 def get_portfolio():
     try:
-        # ... (CSV reading logic stays the same) ...
+        # 1. Read the CSV (This is the code that defines 'df'!)
+        csv_path = os.path.join(os.path.dirname(__file__), '..', 'trades.csv')
+        df = pd.read_csv(csv_path)
         
+        # Clean columns and dates
+        df.columns = ['ticker', 'shares', 'purchase_date']
+        df['purchase_date'] = pd.to_datetime(df['purchase_date'])
+        
+        # We only want active/past trades, no future trades
+        today = pd.Timestamp.today().normalize()
+        df = df[df['purchase_date'] <= today]
+        
+        # Get unique tickers and necessary FX pairs
         unique_tickers = df['ticker'].unique().tolist()
         fx_pairs = list(set([get_fx_pair(t) for t in unique_tickers if get_fx_pair(t)]))
         all_symbols = unique_tickers + fx_pairs
 
-        # 2. Bulk Download Data (UPDATED)
-        
-        # Create a custom session with a browser User-Agent
+        # 2. Bulk Download Data
+        # Create a custom session with a browser User-Agent to bypass Yahoo's Vercel block
         session = requests.Session()
         session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
@@ -32,11 +48,9 @@ def get_portfolio():
             all_symbols, 
             period="2y", 
             group_by='ticker', 
-            threads=False,    # <-- Critical for Vercel environments
-            session=session   # <-- Critical to bypass Yahoo's IP block
+            threads=False,    
+            session=session   
         )
-        
-        # ... (Rest of your calculation logic stays exactly the same) ...
         
         holdings = []
         total_market_value = 0
@@ -56,11 +70,10 @@ def get_portfolio():
             # Skip fully sold positions
             if shares <= 0: continue
             
-            # --- UPDATED TICKER EXTRACTION ---
+            # Extract ticker history handling yfinance MultiIndex changes
             if len(all_symbols) == 1:
                 hist = data
             else:
-                # Handle old yfinance (ticker at level 0) and new yfinance (ticker at level 1)
                 if ticker in data.columns.levels[0]:
                     hist = data[ticker]
                 elif ticker in data.columns.levels[1]:
@@ -73,7 +86,7 @@ def get_portfolio():
             # Get Current Price
             current_price_local = float(hist['Close'].iloc[-1])
             
-            # Get Average Purchase Price
+            # Get Average Purchase Price 
             buy_date = row['first_buy']
             try:
                 idx = hist.index.get_indexer([buy_date], method='bfill')[0]
@@ -81,7 +94,7 @@ def get_portfolio():
             except:
                 purchase_price_local = current_price_local # Fallback
                 
-            # --- UPDATED FX EXTRACTION ---
+            # Handle FX Conversion handling yfinance MultiIndex changes
             fx_pair = get_fx_pair(ticker)
             fx_rate = 1.0
             if fx_pair:
@@ -138,6 +151,5 @@ def get_portfolio():
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
-# Vercel needs this to boot the WSGI application
 if __name__ == '__main__':
     app.run(debug=True)
