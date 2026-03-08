@@ -5,13 +5,12 @@ import pandas as pd
 import os
 import requests
 
+# Reroute yfinance cache to Vercel's writable /tmp directory
 yf.set_tz_cache_location("/tmp/yfinance")
 
 app = Flask(__name__)
-# Enable CORS so your frontend can talk to this API without security blocks
 CORS(app)
 
-# Helper function to map suffixes to Yahoo Finance FX pairs
 def get_fx_pair(ticker):
     if ticker.endswith('.NS'): return 'INRUSD=X'
     if ticker.endswith('.MC'): return 'EURUSD=X'
@@ -21,31 +20,33 @@ def get_fx_pair(ticker):
 @app.route('/api', methods=['GET'])
 def get_portfolio():
     try:
-        # 1. Read the CSV (This is the code that defines 'df'!)
         csv_path = os.path.join(os.path.dirname(__file__), '..', 'trades.csv')
+        
+        # TRIPWIRE 1: Check if Vercel actually bundled the CSV file
+        if not os.path.exists(csv_path):
+            return jsonify({"error": f"CRITICAL: trades.csv not found at {csv_path}. Check vercel.json includeFiles."}), 404
+            
         df = pd.read_csv(csv_path)
         
-        # Clean columns and dates
+        # TRIPWIRE 2: Check if the CSV is being read but is completely empty
+        if df.empty:
+            return jsonify({"error": "CRITICAL: trades.csv was found and read, but it contains no data!"}), 400
+        
         df.columns = ['ticker', 'shares', 'purchase_date']
         df['purchase_date'] = pd.to_datetime(df['purchase_date'])
         
-        # We only want active/past trades, no future trades
         today = pd.Timestamp.today().normalize()
         df = df[df['purchase_date'] <= today]
         
-        # Get unique tickers and necessary FX pairs
         unique_tickers = df['ticker'].unique().tolist()
         fx_pairs = list(set([get_fx_pair(t) for t in unique_tickers if get_fx_pair(t)]))
         all_symbols = unique_tickers + fx_pairs
 
-        # 2. Bulk Download Data
-        # Create a custom session with a browser User-Agent to bypass Yahoo's Vercel block
         session = requests.Session()
         session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
         })
 
-        # Turn threading OFF and pass the custom session
         data = yf.download(
             all_symbols, 
             period="2y", 
@@ -54,25 +55,29 @@ def get_portfolio():
             session=session   
         )
         
+        # TRIPWIRE 3: Check if Yahoo Finance blocked the Vercel server IP
+        if data is None or data.empty:
+            return jsonify({
+                "error": "CRITICAL: Yahoo Finance returned an empty dataset. The Vercel AWS IP is blocked.",
+                "symbols_requested": all_symbols,
+                "action_required": "Swap yfinance for a free API like Alpha Vantage or Finnhub."
+            }), 403
+        
         holdings = []
         total_market_value = 0
         total_invested = 0
         
-        # Aggregate net shares per ticker (handles buys and sells)
         portfolio_summary = df.groupby('ticker').agg(
             net_shares=('shares', 'sum'),
             first_buy=('purchase_date', 'min')
         ).reset_index()
 
-        # 3. Calculate Metrics
         for _, row in portfolio_summary.iterrows():
             ticker = row['ticker']
             shares = row['net_shares']
             
-            # Skip fully sold positions
             if shares <= 0: continue
             
-            # Extract ticker history handling yfinance MultiIndex changes
             if len(all_symbols) == 1:
                 hist = data
             else:
@@ -85,18 +90,15 @@ def get_portfolio():
                 
             if hist is None or hist.empty: continue
             
-            # Get Current Price
             current_price_local = float(hist['Close'].iloc[-1])
             
-            # Get Average Purchase Price 
             buy_date = row['first_buy']
             try:
                 idx = hist.index.get_indexer([buy_date], method='bfill')[0]
                 purchase_price_local = float(hist['Close'].iloc[idx])
             except:
-                purchase_price_local = current_price_local # Fallback
+                purchase_price_local = current_price_local 
                 
-            # Handle FX Conversion handling yfinance MultiIndex changes
             fx_pair = get_fx_pair(ticker)
             fx_rate = 1.0
             if fx_pair:
@@ -110,7 +112,6 @@ def get_portfolio():
             current_price_usd = current_price_local * fx_rate
             purchase_price_usd = purchase_price_local * fx_rate
             
-            # Math
             market_value = current_price_usd * shares
             invested_amount = purchase_price_usd * shares
             pnl = market_value - invested_amount
@@ -129,7 +130,6 @@ def get_portfolio():
                 "return_pct": round(return_pct, 2)
             })
 
-        # 4. Final Portfolio Math
         INITIAL_CAPITAL = 100000
         cash = INITIAL_CAPITAL - total_invested
         total_portfolio_value = total_market_value + cash
