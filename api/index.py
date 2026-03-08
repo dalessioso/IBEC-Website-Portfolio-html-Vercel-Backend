@@ -5,6 +5,8 @@ import pandas as pd
 import os
 import requests
 
+yf.set_tz_cache_location("/tmp/yfinance")
+
 app = Flask(__name__)
 # Enable CORS so your frontend can talk to this API without security blocks
 CORS(app)
