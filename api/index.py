@@ -57,32 +57,41 @@ def get_portfolio():
             # Skip fully sold positions
             if shares <= 0: continue
             
-            # Extract ticker history
+            # --- UPDATED TICKER EXTRACTION ---
             if len(all_symbols) == 1:
                 hist = data
             else:
-                hist = data[ticker] if ticker in data.columns.levels[0] else None
+                # Handle old yfinance (ticker at level 0) and new yfinance (ticker at level 1)
+                if ticker in data.columns.levels[0]:
+                    hist = data[ticker]
+                elif ticker in data.columns.levels[1]:
+                    hist = data.xs(ticker, level=1, axis=1)
+                else:
+                    hist = None
                 
             if hist is None or hist.empty: continue
             
             # Get Current Price
             current_price_local = float(hist['Close'].iloc[-1])
             
-            # Get Average Purchase Price (Simplified to first buy date for this iteration)
+            # Get Average Purchase Price
             buy_date = row['first_buy']
             try:
-                # Find the closest trading day to the purchase date
                 idx = hist.index.get_indexer([buy_date], method='bfill')[0]
                 purchase_price_local = float(hist['Close'].iloc[idx])
             except:
                 purchase_price_local = current_price_local # Fallback
                 
-            # Handle FX Conversion
+            # --- UPDATED FX EXTRACTION ---
             fx_pair = get_fx_pair(ticker)
             fx_rate = 1.0
-            if fx_pair and fx_pair in data.columns.levels[0]:
-                fx_hist = data[fx_pair]
-                fx_rate = float(fx_hist['Close'].iloc[-1])
+            if fx_pair:
+                if fx_pair in data.columns.levels[0]:
+                    fx_hist = data[fx_pair]
+                    fx_rate = float(fx_hist['Close'].iloc[-1])
+                elif fx_pair in data.columns.levels[1]:
+                    fx_hist = data.xs(fx_pair, level=1, axis=1)
+                    fx_rate = float(fx_hist['Close'].iloc[-1])
                 
             current_price_usd = current_price_local * fx_rate
             purchase_price_usd = purchase_price_local * fx_rate
